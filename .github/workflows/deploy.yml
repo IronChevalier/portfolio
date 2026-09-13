@@ -17,7 +17,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
 
       - run: npm ci
@@ -35,7 +35,7 @@ jobs:
             mkdir -p /var/www/releases/${{ github.sha }}
 
       - name: Upload build
-        uses: appleboy/scp-action@SHA_FROM_STEP_1  # v1.0.0
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345  # v1.0.0
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: deploy
@@ -56,4 +56,4 @@ jobs:
             test -f "$REL/index.html" || { echo "no index.html in release"; exit 1; }
             ln -sfn "$REL" /var/www/portfolio.tmp
             mv -T /var/www/portfolio.tmp /var/www/portfolio
-            ls -1dt /var/www/releases/*/ | tail -n +6 | xargs -r rm -rf
+            ls -1dt /var/www/releases/*/ | tail -n +6 | xargs -r rm -rf || true
