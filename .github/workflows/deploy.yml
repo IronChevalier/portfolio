@@ -1,59 +1,140 @@
-name: Deploy Portfolio
+name: Deploy
 
 on:
   push:
     branches: [main]
+  pull_request:
+  workflow_dispatch:
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-          cache: 'npm'
+          cache: npm
 
       - run: npm ci
 
       - run: npm run build
 
-      - name: Create release directory
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
-        with:
-          host: ${{ secrets.DROPLET_HOST }}
-          username: deploy
-          key: ${{ secrets.DROPLET_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            mkdir -p /var/www/releases/${{ github.sha }}
+      - name: Stamp the build with its commit
+        run: printf '%s\n' "$GITHUB_SHA" > dist/version.txt
 
-      - name: Upload build
-        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345  # v1.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          host: ${{ secrets.DROPLET_HOST }}
-          username: deploy
-          key: ${{ secrets.DROPLET_SSH_KEY }}
-          source: "dist/*"
-          target: "/var/www/releases/${{ github.sha }}"
-          strip_components: 1
+          name: site
+          path: dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Activate release
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    env:
+      RELEASE: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          host: ${{ secrets.DROPLET_HOST }}
-          username: deploy
-          key: ${{ secrets.DROPLET_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            REL=/var/www/releases/${{ github.sha }}
-            test -f "$REL/index.html" || { echo "no index.html in release"; exit 1; }
-            ln -sfn "$REL" /var/www/portfolio.tmp
-            mv -T /var/www/portfolio.tmp /var/www/portfolio
-            ls -1dt /var/www/releases/*/ | tail -n +6 | xargs -r rm -rf || true
+          name: site
+          path: dist
+
+      - name: Set up SSH
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_KNOWN_HOSTS: ${{ secrets.DROPLET_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          (umask 077; printf '%s\n' "$DROPLET_SSH_KEY" | tr -d '\r' > ~/.ssh/deploy_key)
+          printf '%s\n' "$DROPLET_KNOWN_HOSTS" | tr -d '\r' > ~/.ssh/known_hosts
+          printf '%s\n' \
+            'Host droplet' \
+            "  HostName $DROPLET_HOST" \
+            '  User deploy' \
+            '  IdentityFile ~/.ssh/deploy_key' \
+            '  IdentitiesOnly yes' \
+            '  StrictHostKeyChecking yes' \
+            '  BatchMode yes' \
+            '  ConnectTimeout 15' \
+            > ~/.ssh/config
+          ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub
+          ssh-keygen -l -f ~/.ssh/deploy_key.pub
+
+      - name: Preflight checks on the droplet
+        run: |
+          ssh droplet bash -s <<'REMOTE'
+          set -euo pipefail
+          test -w /var/www/releases || { echo "deploy can't write /var/www/releases"; exit 1; }
+          test -w /var/www || { echo "deploy can't write /var/www, which the swap needs"; exit 1; }
+          test -L /var/www/portfolio || { echo "/var/www/portfolio is missing or not a symlink"; exit 1; }
+          free_kb="$(df -Pk /var/www/releases | awk 'NR==2 {print $4}')"
+          [ "$free_kb" -ge 204800 ] || { echo "less than 200 MB free on disk"; exit 1; }
+          echo "preflight ok (${free_kb} KB free)"
+          REMOTE
+
+      - name: Upload the release
+        run: |
+          tar -C dist -czf - . \
+            | ssh droplet "mkdir -p /var/www/releases/$RELEASE && tar -C /var/www/releases/$RELEASE -xzmf -"
+
+      - name: Switch the live site to this release
+        run: |
+          ssh droplet bash -s -- "$RELEASE" <<'REMOTE'
+          set -euo pipefail
+          release="$1"
+          [[ "$release" =~ ^[0-9a-f]{40}$ ]] || { echo "unexpected release id: $release"; exit 1; }
+          dir="/var/www/releases/$release"
+          test -f "$dir/index.html" || { echo "no index.html in $dir"; exit 1; }
+          ln -sfn "$dir" /var/www/portfolio.tmp
+          mv -T /var/www/portfolio.tmp /var/www/portfolio
+          echo "live: $(readlink /var/www/portfolio)"
+          REMOTE
+
+      - name: Confirm the live site serves this release
+        run: |
+          for attempt in 1 2 3 4 5; do
+            served="$(curl -fsS --max-time 10 https://quinlanchevalier.ca/version.txt || true)"
+            if [ "$served" = "$RELEASE" ]; then
+              echo "live site is serving $RELEASE"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "expected $RELEASE, live site served: ${served:-nothing}"
+          exit 1
+
+      - name: Delete old releases (keep newest 5, never the live one)
+        continue-on-error: true
+        run: |
+          ssh droplet bash -s <<'REMOTE'
+          set -euo pipefail
+          live="$(readlink -f /var/www/portfolio)"
+          cd /var/www/releases
+          ls -1dt -- */ | tail -n +6 | while IFS= read -r entry; do
+            path="/var/www/releases/${entry%/}"
+            if [ "$path" = "$live" ]; then continue; fi
+            rm -rf -- "$path"
+            echo "deleted ${entry%/}"
+          done
+          REMOTE
