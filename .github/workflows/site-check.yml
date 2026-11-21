@@ -1,0 +1,44 @@
+name: Site check
+
+on:
+  schedule:
+    - cron: '17 14 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: site-check
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Check the live site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SITE: quinlanchevalier.ca
+      MIN_DAYS: 14
+    steps:
+      - name: HTTPS works on both addresses
+        run: |
+          for host in "$SITE" "www.$SITE"; do
+            curl -sS --fail --max-time 20 -o /dev/null "https://$host/"
+            echo "ok: https://$host/"
+          done
+
+      - name: Certificate is not about to expire
+        run: |
+          cert="$(echo | timeout 20 openssl s_client -connect "$SITE:443" -servername "$SITE" 2>/dev/null)"
+          printf '%s\n' "$cert" | openssl x509 -noout -subject -enddate
+          printf '%s\n' "$cert" | openssl x509 -noout -checkend $((MIN_DAYS * 86400))
+
+      - name: Missing pages return 404
+        run: |
+          code="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://$SITE/site-check-no-such-page")"
+          echo "status: $code"
+          [ "$code" = "404" ]
