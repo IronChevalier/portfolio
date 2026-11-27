@@ -27,7 +27,12 @@ jobs:
           node-version: '24'
           cache: npm
 
-      - run: npm ci
+      # --ignore-scripts: no package runs its own install commands here.
+      # None of ours need one (only fsevents, macOS-only, declares one).
+      - run: npm ci --ignore-scripts
+
+      - name: Check package signatures
+        run: npm audit signatures
 
       - run: npm run build
 
